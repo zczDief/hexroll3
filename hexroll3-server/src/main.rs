@@ -131,6 +131,16 @@ struct SettlementInfo {
     population: String,
     /// NPCs notáveis do assentamento (candidatos a hireling).
     npcs: Vec<NpcBrief>,
+    /// Ganchos de aventura / missões oferecidos no assentamento.
+    quests: Vec<QuestBrief>,
+}
+
+#[derive(Serialize)]
+struct QuestBrief {
+    /// "treasure" / "missing-person" / "escort" / "delivery"
+    kind: String,
+    /// Texto da missão já renderizado pelo motor (nomes, recompensa, local).
+    text: String,
 }
 
 #[derive(Serialize)]
@@ -603,6 +613,54 @@ fn npc_class_level(class: &str) -> Option<(String, i64)> {
     None
 }
 
+/// Mapeia a classe de uma entidade de quest do hexroll para um tipo curto.
+/// Retorna `None` para classes que não são missões oferecíveis.
+fn quest_kind(class: &str) -> Option<String> {
+    match class {
+        "TreasureQuest" => Some("treasure".to_string()),
+        "MissingPersonQuest" => Some("missing-person".to_string()),
+        "EscortQuest" => Some("escort".to_string()),
+        "DeliveryQuest" => Some("delivery".to_string()),
+        _ => None,
+    }
+}
+
+/// Limpa o texto renderizado de uma quest: colapsa espaços, conserta mojibake
+/// de apóstrofo e remove artefatos de links não resolvidos headless
+/// ("held captive in the)" → "held captive somewhere.", "(hex )"…).
+fn clean_quest_text(s: &str) -> String {
+    let mut t = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Apóstrofo curvo (U+2019) decodificado errado vira "â"; normaliza.
+    t = t.replace("â€™", "'").replace('â', "'");
+    t = t
+        .replace("(hex )", "")
+        .replace("in the)", "somewhere.")
+        .replace("in the )", "somewhere.")
+        .replace(" in and ", " and ")
+        .replace(" in the Finder", ". The finder")
+        .replace(" in .", ".")
+        .replace(" )", "")
+        .replace("( ", "(")
+        .replace(" .", ".")
+        .replace(" ,", ",")
+        .replace("..", ".");
+    while t.contains("  ") {
+        t = t.replace("  ", " ");
+    }
+    t.trim().to_string()
+}
+
+/// Uma quest renderizada é boa o bastante para mostrar? Descarta as que
+/// dependem de links vazios headless (entrega sem destino/recompensa).
+fn quest_text_ok(t: &str) -> bool {
+    let low = t.to_lowercase();
+    let words = t.split_whitespace().count();
+    words >= 6
+        && !low.ends_with("reward is")
+        && !low.ends_with("reward is.")
+        && !low.contains("deliver to. reward")
+}
+
 /// Recursively collect UID-looking strings from a JSON value (8-char
 /// alphanumerics), following UUID-keyed references to a bounded depth.
 fn collect_uids_recursive(val: &Value, uids: &mut Vec<String>, depth: u32) {
@@ -784,6 +842,36 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                 });
             }
 
+            // Ganchos de aventura: caminhada transitiva pela subárvore do
+            // assentamento, renderizando entidades de quest (o texto só resolve
+            // via render_entity — nomes, dungeons e recompensa entram aí).
+            let mut quests: Vec<QuestBrief> = Vec::new();
+            {
+                let mut seenq = std::collections::HashSet::new();
+                let mut frontier = vec![uid.clone()];
+                while let Some(u) = frontier.pop() {
+                    if quests.len() >= 6 || !seenq.insert(u.clone()) || seenq.len() > 4000 {
+                        if quests.len() >= 6 { break; }
+                        continue;
+                    }
+                    let Ok(e) = tx.load(&u) else { continue };
+                    let cl = e.value["class"].as_str().unwrap_or("");
+                    if let Some(qkind) = quest_kind(cl) {
+                        if let Ok(rq) = render_entity(&render_instance, &mut bp, tx, &e.value, true) {
+                            let text = clean_quest_text(&html_to_text(rq["Description"].as_str().unwrap_or("")));
+                            if quest_text_ok(&text)
+                                && !quests.iter().any(|q: &QuestBrief| q.text == text)
+                            {
+                                quests.push(QuestBrief { kind: qkind, text });
+                            }
+                        }
+                    }
+                    let mut ch = Vec::new();
+                    collect_uids_recursive(&e.value, &mut ch, 3);
+                    for c in ch { if !seenq.contains(&c) { frontier.push(c); } }
+                }
+            }
+
             settlements.push(SettlementInfo {
                 uid: uid.clone(),
                 name,
@@ -792,6 +880,7 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                 hex: field_str(&r, "HexLink"),
                 population: field_str(&r, "Population"),
                 npcs,
+                quests,
             });
         }
 
