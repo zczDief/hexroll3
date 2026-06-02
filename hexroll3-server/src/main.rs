@@ -209,9 +209,11 @@ async fn generate(
     // can't fix from outside). A wall-clock timeout abandons those so the client
     // gets a fast 500 and falls back to offline gen instead of hanging. The
     // orphaned blocking task keeps running but holds only its own sandbox/locks.
-    // Observed successful generations finish in <8s; 12s gives headroom while
-    // bounding the fallback wait for pathological (infinite-loop) seeds.
-    const GEN_TIMEOUT_SECS: u64 = 12;
+    // Small worlds finish in a few seconds, but large realms (10+ regions, many
+    // settlements/dungeons) can take tens of seconds; a generous budget lets
+    // those complete (a frontend spinner covers the wait) while still bounding
+    // the fallback for pathological (infinite-loop) seeds.
+    const GEN_TIMEOUT_SECS: u64 = 60;
     let handle = tokio::task::spawn_blocking(move || generate_world(&scroll_dir, seed));
     let result = match tokio::time::timeout(
         std::time::Duration::from_secs(GEN_TIMEOUT_SECS),
