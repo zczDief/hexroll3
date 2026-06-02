@@ -174,6 +174,8 @@ struct AreaInfo {
     /// Armadilha da sala (de Feature.AreaTrap), se houver.
     #[serde(skip_serializing_if = "Option::is_none")]
     trap: Option<TrapBrief>,
+    /// Números das salas conectadas por passagem (grafo real de corredores).
+    connections: Vec<i64>,
 }
 
 #[derive(Serialize)]
@@ -834,6 +836,27 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                     if !is_area {
                         continue;
                     }
+                    // Grafo real de corredores: as passagens da sala carregam o
+                    // número da sala-alvo (Room). Coletamos esses alvos.
+                    let mut connections: Vec<i64> = Vec::new();
+                    if let Some(o) = c_raw.value.as_object() {
+                        for (k, v) in o {
+                            if !k.starts_with("passage_") && !k.starts_with("secret_door_") {
+                                continue;
+                            }
+                            let cu = v.as_array().and_then(|a| a.first()).and_then(|x| x.as_str())
+                                .or_else(|| v.as_str());
+                            if let Some(cu) = cu {
+                                if let Ok(cr) = tx.load(cu) {
+                                    if let Some(room) = cr.value["Room"].as_i64() {
+                                        if !connections.contains(&room) {
+                                            connections.push(room);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let ar = render_uid!(c).unwrap_or(Value::Null);
                     let title = {
                         let t = field_str(&ar, "RoomType");
@@ -893,6 +916,7 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                         treasure_gold,
                         treasure_items,
                         trap,
+                        connections,
                     });
                 }
                 areas.sort_by_key(|a| a.number);
