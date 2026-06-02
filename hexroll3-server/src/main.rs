@@ -56,6 +56,43 @@ static SANDBOX_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct GenerateRequest {
     /// Optional seed for reproducible worlds. Omit for a random world.
     seed: Option<u64>,
+    /// Map size requested by the game's size chip: "small" / "medium" /
+    /// "large" / "giant". Bounds the realm (regions × tiles per region) so
+    /// small maps generate fast and rarely time out. Omit → "medium".
+    map_size: Option<String>,
+}
+
+/// Realm sizing per map-size chip, chosen so total hexes ≈ the game's targets
+/// (small 91 · medium 169 · large 331 · giant 631). Region count is fixed
+/// (min == max) for predictable size; tiles-per-region is a tight band.
+/// Fewer regions also means fewer dungeon excavations → much faster gen.
+#[derive(Clone, Copy)]
+struct RealmSizing {
+    regions: i64,
+    tiles_min: i64,
+    tiles_max: i64,
+    /// Total dungeons to excavate across the realm. Dungeon excavation
+    /// (cartographer) dominates generation time, so this is the main cost knob.
+    max_dungeons: usize,
+    /// Wall-clock budget before falling back to offline gen.
+    timeout_secs: u64,
+}
+
+fn realm_sizing(map_size: Option<&str>) -> RealmSizing {
+    // Dungeon excavation (cartographer) costs ~5s each and dominates gen time,
+    // so `max_dungeons` is the main cost knob. Timeouts ≈ budget×5s + ~50%
+    // margin, leaving headroom for excavation variance and slow (but finite)
+    // seeds while still bounding pathological (infinite-loop) ones.
+    match map_size.unwrap_or("medium") {
+        // ~5×19 ≈ 95 hexes · ~25s
+        "small" => RealmSizing { regions: 5, tiles_min: 16, tiles_max: 22, max_dungeons: 5, timeout_secs: 45 },
+        // ~12×28 ≈ 336 hexes · ~75s
+        "large" => RealmSizing { regions: 12, tiles_min: 24, tiles_max: 32, max_dungeons: 15, timeout_secs: 115 },
+        // ~19×33 ≈ 627 hexes · ~110s
+        "giant" => RealmSizing { regions: 19, tiles_min: 30, tiles_max: 36, max_dungeons: 22, timeout_secs: 165 },
+        // medium ~8×21 ≈ 168 hexes · ~45s
+        _ => RealmSizing { regions: 8, tiles_min: 18, tiles_max: 24, max_dungeons: 9, timeout_secs: 70 },
+    }
 }
 
 /// Lean, game-focused world description. The frontend lays out the navigable
@@ -264,6 +301,8 @@ async fn generate(
 ) -> impl IntoResponse {
     let scroll_dir = state.scroll_dir.clone();
     let seed = req.seed;
+    let map_size = req.map_size.clone();
+    let sizing = realm_sizing(map_size.as_deref());
 
     // Generation is synchronous & CPU-heavy (redb + minijinja) → offload it
     // off the async runtime so we don't starve other connections.
@@ -277,17 +316,17 @@ async fn generate(
     // settlements/dungeons) can take tens of seconds; a generous budget lets
     // those complete (a frontend spinner covers the wait) while still bounding
     // the fallback for pathological (infinite-loop) seeds.
-    const GEN_TIMEOUT_SECS: u64 = 60;
-    let handle = tokio::task::spawn_blocking(move || generate_world(&scroll_dir, seed));
+    let timeout_secs = sizing.timeout_secs;
+    let handle = tokio::task::spawn_blocking(move || generate_world(&scroll_dir, seed, sizing));
     let result = match tokio::time::timeout(
-        std::time::Duration::from_secs(GEN_TIMEOUT_SECS),
+        std::time::Duration::from_secs(timeout_secs),
         handle,
     )
     .await
     {
         Ok(joined) => joined,
         Err(_) => {
-            tracing::warn!("generation timed out after {GEN_TIMEOUT_SECS}s (seed {seed:?})");
+            tracing::warn!("generation timed out after {timeout_secs}s (seed {seed:?}, size {map_size:?})");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "generation timed out" })),
@@ -318,7 +357,7 @@ async fn generate(
 }
 
 /// Generate a fresh world, render every entity, and return it in-memory.
-fn generate_world(scroll_dir: &PathBuf, seed: Option<u64>) -> Result<GenerateResponse> {
+fn generate_world(scroll_dir: &PathBuf, seed: Option<u64>, sizing: RealmSizing) -> Result<GenerateResponse> {
     let n = SANDBOX_COUNTER.fetch_add(1, Ordering::Relaxed);
     let sandbox_path = std::env::temp_dir()
         .join(format!("hexroll3-server-{}-{}.hxr", seed.unwrap_or(0), n));
@@ -341,6 +380,19 @@ fn generate_world(scroll_dir: &PathBuf, seed: Option<u64>) -> Result<GenerateRes
             .lock()
             .map_err(|_| anyhow!("blueprint lock"))?;
         bp.map_data_provider = hexroll3_cartographer::dungeons::map_data_providers();
+
+        // Override the realm-size globals parsed from the scroll so the world
+        // matches the requested map-size chip. Region count is fixed and the
+        // tiles-per-region band is tightened; this is read at create() time,
+        // so setting it after with_scroll() (which loaded the defaults) wins.
+        // Fewer regions ⇒ fewer forced dungeon excavations ⇒ much faster gen
+        // and a far lower chance of hitting a pathological (looping) instance.
+        bp.globals.insert("minimum_number_of_regions".into(), serde_json::json!(sizing.regions));
+        bp.globals.insert("maximum_number_of_regions".into(), serde_json::json!(sizing.regions));
+        for terr in ["mountains", "forest", "desert", "plains", "jungle", "swamps", "tundra"] {
+            bp.globals.insert(format!("minimum_tiles_per_{terr}_region"), serde_json::json!(sizing.tiles_min));
+            bp.globals.insert(format!("maximum_tiles_per_{terr}_region"), serde_json::json!(sizing.tiles_max));
+        }
     }
     instance.create(
         sandbox_path
@@ -351,7 +403,7 @@ fn generate_world(scroll_dir: &PathBuf, seed: Option<u64>) -> Result<GenerateRes
     // Drive hexroll's own generators headless to populate settlements & dungeons
     // (the initial roll only fills terrain + a roaming monster per hex; features
     // are normally rolled on-demand when a user clicks a hex in the app).
-    populate_features(&instance)?;
+    populate_features(&instance, sizing)?;
 
     let resp = export_all(instance, seed)?;
 
@@ -407,7 +459,7 @@ fn hexes_by_region(instance: &SandboxInstance) -> Result<Vec<Vec<String>>> {
 /// Roll settlements & dungeons onto a seed-chosen subset of hexes by invoking
 /// hexroll's `append` generator — the same path the interactive app uses. With
 /// the cartographer provider wired, dungeon appends also generate interiors.
-fn populate_features(instance: &SandboxInstance) -> Result<()> {
+fn populate_features(instance: &SandboxInstance, sizing: RealmSizing) -> Result<()> {
     let regions = hexes_by_region(instance)?;
     if regions.is_empty() {
         return Ok(());
@@ -426,31 +478,47 @@ fn populate_features(instance: &SandboxInstance) -> Result<()> {
         regions.len(),
         regions.iter().map(|r| r.len()).sum::<usize>()
     );
-    // NOTE: we deliberately do NOT cap counts or force settlement/dungeon
-    // classes. Some seeds hit data-dependent infinite loops in the hexroll
-    // scroll generation; every attempt to dodge them (caps, class overrides)
-    // merely shifts the RNG stream and reshuffles *which* seeds hang — net
-    // neutral-to-worse. The wall-clock timeout in the request handler bounds
-    // the fallout: hung seeds return a fast 500 and the client falls back to
-    // the offline procedural generator. So we keep the richest default roll.
+    // One settlement per region; dungeons are budgeted (`sizing.max_dungeons`)
+    // and spread round-robin across regions. Dungeon excavation dominates
+    // generation time, so bounding the count is what keeps small maps fast and
+    // off the timeout. We do NOT force settlement/dungeon *classes* — that just
+    // shifts the RNG stream and reshuffles which seeds hit data-dependent
+    // scroll loops; the wall-clock timeout still bounds those.
+    let region_count = regions.len();
     builder.sandbox.repo.mutate(|tx| {
+        let mut settle_idxs: Vec<usize> = Vec::with_capacity(region_count);
         for hexes in &regions {
             let n = hexes.len();
             if n == 0 {
+                settle_idxs.push(usize::MAX);
                 continue;
             }
-            // ~1 settlement + 1–2 dungeons per region, positions seed-chosen.
             let settle_idx = builder.randomizer.in_range(0, n as i32 - 1) as usize;
+            settle_idxs.push(settle_idx);
             if let Err(e) =
                 append(&builder, &mut blueprint, tx, &hexes[settle_idx], "Settlement", None, 1)
             {
                 tracing::warn!("append Settlement on {}: {e:#}", hexes[settle_idx]);
             }
+        }
 
-            let dungeon_count = if n >= 16 { 2 } else { 1 };
-            for _ in 0..dungeon_count {
+        // Spread the dungeon budget across regions (round-robin) so coverage is
+        // even rather than front-loading the first regions.
+        let mut placed = 0usize;
+        let mut round = 0usize;
+        while placed < sizing.max_dungeons {
+            let mut any = false;
+            for (ri, hexes) in regions.iter().enumerate() {
+                if placed >= sizing.max_dungeons {
+                    break;
+                }
+                let n = hexes.len();
+                if n == 0 || round >= n {
+                    continue;
+                }
+                any = true;
                 let di = builder.randomizer.in_range(0, n as i32 - 1) as usize;
-                if di == settle_idx {
+                if di == *settle_idxs.get(ri).unwrap_or(&usize::MAX) {
                     continue;
                 }
                 if let Err(e) =
@@ -458,8 +526,14 @@ fn populate_features(instance: &SandboxInstance) -> Result<()> {
                 {
                     tracing::warn!("append Dungeon: {e}");
                 }
+                placed += 1;
             }
+            if !any {
+                break; // every region exhausted
+            }
+            round += 1;
         }
+        tracing::info!("populate: {} settlements, {} dungeons (budget {})", region_count, placed, sizing.max_dungeons);
         Ok(())
     })?;
     Ok(())
