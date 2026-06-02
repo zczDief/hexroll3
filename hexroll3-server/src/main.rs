@@ -129,6 +129,20 @@ struct SettlementInfo {
     region: String,
     hex: String,
     population: String,
+    /// NPCs notáveis do assentamento (candidatos a hireling).
+    npcs: Vec<NpcBrief>,
+}
+
+#[derive(Serialize)]
+struct NpcBrief {
+    name: String,
+    /// classe base em minúsculas: fighter/cleric/magicuser/thief/dwarf/elf/halfling
+    class: String,
+    level: i64,
+    hp: String,
+    armour_class: String,
+    thac0: String,
+    alignment: String,
 }
 
 #[derive(Serialize)]
@@ -515,6 +529,20 @@ fn monster_brief(v: &Value) -> Option<MonsterBrief> {
     })
 }
 
+/// Parse a hexroll NPC class like "FighterLevel5" → ("fighter", 5).
+fn npc_class_level(class: &str) -> Option<(String, i64)> {
+    for base in ["Fighter", "Cleric", "Magicuser", "Thief", "Dwarf", "Elf", "Halfling"] {
+        if let Some(rest) = class.strip_prefix(base) {
+            if let Some(num) = rest.strip_prefix("Level") {
+                if let Ok(lvl) = num.parse::<i64>() {
+                    return Some((base.to_lowercase(), lvl));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Recursively collect UID-looking strings from a JSON value (8-char
 /// alphanumerics), following UUID-keyed references to a bounded depth.
 fn collect_uids_recursive(val: &Value, uids: &mut Vec<String>, depth: u32) {
@@ -666,6 +694,36 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                 let n = field_str(&r, "Name");
                 if n.is_empty() { field_str(&r, "Title") } else { n }
             };
+
+            // NPCs notáveis: entidades com classe "<Classe>Level<N>" no subtree.
+            let mut npcs: Vec<NpcBrief> = Vec::new();
+            let mut cand: Vec<String> = Vec::new();
+            collect_uids_recursive(&raw.value, &mut cand, 5);
+            cand.sort();
+            cand.dedup();
+            for c in &cand {
+                if npcs.len() >= 6 {
+                    break;
+                }
+                let Ok(craw) = tx.load(c) else { continue };
+                let cls = craw.value["class"].as_str().unwrap_or("");
+                let Some((base, level)) = npc_class_level(cls) else { continue };
+                let nr = render_uid!(c).unwrap_or(Value::Null);
+                let nname = {
+                    let n = field_str(&nr, "Name");
+                    if n.is_empty() { field_str(&nr, "Title") } else { n }
+                };
+                npcs.push(NpcBrief {
+                    name: if nname.is_empty() { base.clone() } else { nname },
+                    class: base,
+                    level,
+                    hp: field_str(&nr, "HP"),
+                    armour_class: field_str(&nr, "ArmourClass"),
+                    thac0: field_str(&nr, "THAC0"),
+                    alignment: field_str(&nr, "Alignment"),
+                });
+            }
+
             settlements.push(SettlementInfo {
                 uid: uid.clone(),
                 name,
@@ -673,6 +731,7 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                 region: field_str(&r, "Region"),
                 hex: field_str(&r, "HexLink"),
                 population: field_str(&r, "Population"),
+                npcs,
             });
         }
 
