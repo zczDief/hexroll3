@@ -41,11 +41,35 @@ struct Cli {
     /// Address to bind.
     #[arg(long, default_value = "127.0.0.1:8787")]
     bind: String,
+
+    // ── Internal worker mode ────────────────────────────────────────────────
+    // Each /generate request re-execs this same binary with `--worker` to do the
+    // actual (CPU-heavy, sometimes pathological) world roll in a *separate
+    // process*. The parent waits with a deadline and, on overrun, SIGKILLs the
+    // child — which actually frees the CPU. Doing the roll on an in-process
+    // thread could not be cancelled (a looping seed pinned a core forever and
+    // poisoned every later request); a child process can.
+    /// Internal: generate one world, write JSON to --out, exit. Not for direct use.
+    #[arg(long, hide = true)]
+    worker: bool,
+    /// Worker: optional seed for reproducible worlds.
+    #[arg(long, hide = true)]
+    seed: Option<u64>,
+    /// Worker: map size ("small"/"medium"/"large"/"giant").
+    #[arg(long, hide = true)]
+    map_size: Option<String>,
+    /// Worker: path to write the generated world JSON to.
+    #[arg(long, hide = true)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 struct AppState {
     scroll_dir: Arc<PathBuf>,
+    /// Bounds how many generation subprocesses run at once so a burst of
+    /// requests can't oversubscribe the CPU (each worker is single-threaded but
+    /// CPU-bound). Sized to leave a core for the async runtime + I/O.
+    gen_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Monotonic counter to keep concurrent sandbox temp files unique even for
@@ -65,32 +89,38 @@ struct GenerateRequest {
 /// Realm sizing per map-size chip, chosen so total hexes ≈ the game's targets
 /// (small 91 · medium 169 · large 331 · giant 631). Region count is fixed
 /// (min == max) for predictable size; tiles-per-region is a tight band.
-/// Fewer regions also means fewer dungeon excavations → much faster gen.
+///
+/// Cost model (measured, not assumed): the initial realm `create()` roll
+/// dominates — it instantiates every hex (terrain + roaming monster) and scales
+/// ~linearly with hex count (~95 hexes ≈ 9s, ~165 ≈ 19s). Dungeon excavation is
+/// cheap (~5 dungeons in <1s), so `max_dungeons` is a minor knob and mainly
+/// bounds payload size. Pathological seeds (a settlement/dungeon instance that
+/// expands without bound) are handled by killing the worker process, not by
+/// sizing — so the timeouts only need headroom over the *legitimate* roll cost.
 #[derive(Clone, Copy)]
 struct RealmSizing {
     regions: i64,
     tiles_min: i64,
     tiles_max: i64,
-    /// Total dungeons to excavate across the realm. Dungeon excavation
-    /// (cartographer) dominates generation time, so this is the main cost knob.
+    /// Dungeons excavated across the realm. Excavation is cheap; this mostly
+    /// caps payload size and dungeon density.
     max_dungeons: usize,
-    /// Wall-clock budget before falling back to offline gen.
+    /// Wall-clock budget before the worker is killed and the client falls back.
     timeout_secs: u64,
 }
 
 fn realm_sizing(map_size: Option<&str>) -> RealmSizing {
-    // Dungeon excavation (cartographer) costs ~5s each and dominates gen time,
-    // so `max_dungeons` is the main cost knob. Timeouts ≈ budget×5s + ~50%
-    // margin, leaving headroom for excavation variance and slow (but finite)
-    // seeds while still bounding pathological (infinite-loop) ones.
+    // Timeouts ≈ measured roll cost (~0.1s/hex) + generous margin. The margin
+    // is safe to keep wide because an overrunning worker is SIGKILLed (it cannot
+    // leak CPU into later requests), so a high ceiling never poisons the server.
     match map_size.unwrap_or("medium") {
-        // ~5×19 ≈ 95 hexes · ~25s
+        // ~5×19 ≈ 95 hexes · ~10s
         "small" => RealmSizing { regions: 5, tiles_min: 16, tiles_max: 22, max_dungeons: 5, timeout_secs: 45 },
-        // ~12×28 ≈ 336 hexes · ~75s
+        // ~12×28 ≈ 336 hexes · ~40s
         "large" => RealmSizing { regions: 12, tiles_min: 24, tiles_max: 32, max_dungeons: 15, timeout_secs: 115 },
-        // ~19×33 ≈ 627 hexes · ~110s
+        // ~19×33 ≈ 627 hexes · ~75s
         "giant" => RealmSizing { regions: 19, tiles_min: 30, tiles_max: 36, max_dungeons: 22, timeout_secs: 165 },
-        // medium ~8×21 ≈ 168 hexes · ~45s
+        // medium ~8×21 ≈ 168 hexes · ~20s
         _ => RealmSizing { regions: 8, tiles_min: 18, tiles_max: 24, max_dungeons: 9, timeout_secs: 70 },
     }
 }
@@ -269,8 +299,23 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Worker mode: do one generation in this (disposable, killable) process and
+    // exit. The parent server spawns us per request and kills us on timeout.
+    if cli.worker {
+        return run_worker(&cli);
+    }
+
+    // Allow as many concurrent generation subprocesses as we have spare cores
+    // (keep one for the runtime). Generation is CPU-bound and single-threaded
+    // per worker, so this maps ~1 worker per core without thrashing.
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let gen_slots = Arc::new(tokio::sync::Semaphore::new(cores.saturating_sub(1).max(1)));
+
     let state = AppState {
         scroll_dir: Arc::new(cli.scroll_dir.clone()),
+        gen_slots,
     };
 
     let cors = CorsLayer::new()
@@ -299,35 +344,120 @@ async fn generate(
     State(state): State<AppState>,
     Json(req): Json<GenerateRequest>,
 ) -> impl IntoResponse {
-    let scroll_dir = state.scroll_dir.clone();
     let seed = req.seed;
     let map_size = req.map_size.clone();
     let sizing = realm_sizing(map_size.as_deref());
-
-    // Generation is synchronous & CPU-heavy (redb + minijinja) → offload it
-    // off the async runtime so we don't starve other connections.
-    //
-    // Some seeds produce worlds whose hexroll scroll-generation loops forever
-    // (data-dependent infinite loops in certain settlement/dungeon instances we
-    // can't fix from outside). A wall-clock timeout abandons those so the client
-    // gets a fast 500 and falls back to offline gen instead of hanging. The
-    // orphaned blocking task keeps running but holds only its own sandbox/locks.
-    // Small worlds finish in a few seconds, but large realms (10+ regions, many
-    // settlements/dungeons) can take tens of seconds; a generous budget lets
-    // those complete (a frontend spinner covers the wait) while still bounding
-    // the fallback for pathological (infinite-loop) seeds.
     let timeout_secs = sizing.timeout_secs;
-    let handle = tokio::task::spawn_blocking(move || generate_world(&scroll_dir, seed, sizing));
-    let result = match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        handle,
-    )
-    .await
-    {
-        Ok(joined) => joined,
-        Err(_) => {
-            tracing::warn!("generation timed out after {timeout_secs}s (seed {seed:?}, size {map_size:?})");
+
+    // The roll is CPU-heavy and, for some seeds, *pathological*: certain
+    // settlement/dungeon instances expand into an enormous (or genuinely
+    // infinite) entity subtree that pins a core. We cannot fix those data cases
+    // from outside, and an in-process worker thread cannot be cancelled — a
+    // timed-out roll would loop forever, burning a core and poisoning every
+    // later request (a cascade where, after a few bad seeds, nearly everything
+    // times out). So we run each generation in a **separate child process** and
+    // SIGKILL it on overrun, which truly reclaims the CPU. The client gets a
+    // fast 500 and falls back to offline gen; the next request is unaffected.
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("current_exe failed: {e}");
             return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "server misconfigured" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Unique output path per request (pid + counter): the worker writes the
+    // world JSON here and we stream it back, then delete it.
+    let n = SANDBOX_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let out_path = std::env::temp_dir().join(format!(
+        "hexroll3-world-{}-{}-{}.json",
+        std::process::id(),
+        seed.unwrap_or(0),
+        n
+    ));
+
+    // Cap concurrent generations so a burst can't oversubscribe the CPU.
+    let _permit = state.gen_slots.acquire().await.expect("semaphore open");
+
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.arg("--worker")
+        .arg("--scroll-dir")
+        .arg(&*state.scroll_dir)
+        .arg("--out")
+        .arg(&out_path)
+        .kill_on_drop(true);
+    if let Some(s) = seed {
+        cmd.arg("--seed").arg(s.to_string());
+    }
+    if let Some(ms) = &map_size {
+        cmd.arg("--map-size").arg(ms);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("failed to spawn generation worker: {e}");
+            let _ = std::fs::remove_file(&out_path);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "could not start generation" })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait(),
+    )
+    .await;
+
+    let response = match status {
+        // Worker exited in time and succeeded → stream its JSON back verbatim.
+        Ok(Ok(st)) if st.success() => match tokio::fs::read(&out_path).await {
+            Ok(bytes) => (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("worker ok but output unreadable: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "generation output missing" })),
+                )
+                    .into_response()
+            }
+        },
+        // Worker ran but failed (e.g. roll error) → 500, client falls back.
+        Ok(Ok(st)) => {
+            tracing::error!("generation worker exited with {st} (seed {seed:?}, size {map_size:?})");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "generation failed" })),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::error!("waiting on generation worker failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "generation failed" })),
+            )
+                .into_response()
+        }
+        // Deadline hit → kill the (looping) child so it stops eating CPU.
+        Err(_) => {
+            tracing::warn!(
+                "generation timed out after {timeout_secs}s (seed {seed:?}, size {map_size:?}); killing worker"
+            );
+            let _ = child.kill().await;
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "generation timed out" })),
             )
@@ -335,32 +465,36 @@ async fn generate(
         }
     };
 
-    match result {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
-        Ok(Err(e)) => {
-            tracing::error!("generation failed: {e:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("{e:#}") })),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            tracing::error!("generation task panicked: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "generation task panicked" })),
-            )
-                .into_response()
-        }
-    }
+    let _ = tokio::fs::remove_file(&out_path).await;
+    response
+}
+
+/// Worker entry point: generate one world and write it as JSON to `--out`.
+/// Runs in a disposable child process the server kills on timeout.
+fn run_worker(cli: &Cli) -> Result<()> {
+    let out = cli
+        .out
+        .clone()
+        .ok_or_else(|| anyhow!("--worker requires --out"))?;
+    let sizing = realm_sizing(cli.map_size.as_deref());
+    let resp = generate_world(&cli.scroll_dir, cli.seed, sizing)?;
+    let json = serde_json::to_vec(&resp)?;
+    std::fs::write(&out, json)?;
+    Ok(())
 }
 
 /// Generate a fresh world, render every entity, and return it in-memory.
 fn generate_world(scroll_dir: &PathBuf, seed: Option<u64>, sizing: RealmSizing) -> Result<GenerateResponse> {
     let n = SANDBOX_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let sandbox_path = std::env::temp_dir()
-        .join(format!("hexroll3-server-{}-{}.hxr", seed.unwrap_or(0), n));
+    // Include the pid: workers are separate processes (their counters all start
+    // at 0), so two concurrent workers with the same seed would otherwise share
+    // a redb path.
+    let sandbox_path = std::env::temp_dir().join(format!(
+        "hexroll3-server-{}-{}-{}.hxr",
+        std::process::id(),
+        seed.unwrap_or(0),
+        n
+    ));
     // Fresh sandbox every time.
     let _ = std::fs::remove_file(&sandbox_path);
 
