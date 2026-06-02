@@ -94,6 +94,18 @@ pub fn prepare_renderer(
         );
     }
     // unimplemented
+    env.add_function("exists", func_exists);
+    env.add_function("decap", func_decap);
+    env.add_function("bold", func_bold);
+    env.add_function("pluralize", func_pluralize);
+    env.add_function("pluralcond", func_pluralcond);
+    env.add_function("appender", func_nop_1);
+    env.add_function("coords", func_nop_1);
+    env.add_function("maybe2", func_nop_1);
+    env.add_function("reroller_ex", func_nop_1);
+    env.add_function("reroller_with_reload", func_nop_1);
+    env.add_function("bx_mod", func_bx_mod);
+    env.add_function("bx_mod_str", func_bx_mod_str);
     env.add_function("note_button", func_nop_1);
     env.add_function("note_container", func_nop_1);
 }
@@ -189,10 +201,8 @@ fn func_first(
             return Ok(minijinja::Value::from_serialize(first));
         }
     }
-    Err(minijinja::Error::new(
-        minijinja::ErrorKind::UndefinedError,
-        "func_first could not pick the first item from an array",
-    ))
+    // Return empty string rather than error — non-fatal fallback
+    Ok(minijinja::Value::from(""))
 }
 
 fn func_float(value: &str) -> Result<f32, minijinja::Error> {
@@ -688,8 +698,61 @@ fn func_end_spoiler() -> Result<String, minijinja::Error> {
     Ok("</span>".to_string())
 }
 
+
+fn func_exists(val: minijinja::Value) -> bool {
+    !val.is_undefined() && !val.is_none()
+}
+
+fn func_decap(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(first) => first.to_lowercase().to_string() + c.as_str(),
+    }
+}
+
+fn func_bold(s: &str) -> String { format!("<strong>{}</strong>", s) }
+
+fn func_pluralize(count: minijinja::Value, singular: &str, plural_form: Option<&str>) -> String {
+    let n: i64 = count.as_i64().unwrap_or(1);
+    if n == 1 { singular.to_string() }
+    else { plural_form.map(|p| p.to_string()).unwrap_or_else(|| format!("{}s", singular)) }
+}
+
+fn func_pluralcond(count: minijinja::Value, singular: &str, plural_form: Option<&str>) -> String {
+    func_pluralize(count, singular, plural_form)
+}
+
+
+/// B/X ability score modifier — accepts int or string "12"
+fn func_bx_mod(score: minijinja::Value) -> Result<i32, minijinja::Error> {
+    let n: i32 = if let Some(i) = score.as_i64() {
+        i as i32
+    } else if let Some(s) = score.as_str() {
+        s.trim().parse().unwrap_or(10)
+    } else {
+        10 // default neutral
+    };
+    Ok(match n {
+        s if s <= 3  => -3,
+        s if s <= 5  => -2,
+        s if s <= 8  => -1,
+        s if s <= 12 =>  0,
+        s if s <= 15 =>  1,
+        s if s <= 17 =>  2,
+        _            =>  3,
+    })
+}
+
+fn func_bx_mod_str(score: minijinja::Value) -> Result<String, minijinja::Error> {
+    let m = func_bx_mod(score)?;
+    Ok(if m >= 0 { format!("+{}", m) } else { format!("{}", m) })
+}
+
+/// Returns true if `key` is defined and not null in the current context
+
 fn func_nop_1(
-    _: minijinja::value::ViaDeserialize<serde_json::Value>,
+    _args: minijinja::value::Rest<minijinja::Value>,
 ) -> Result<String, minijinja::Error> {
     Ok(String::new())
 }

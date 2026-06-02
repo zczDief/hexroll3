@@ -1,0 +1,15 @@
+[package]
+name = "hexroll3-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Headless CLI for hexroll3 — generates sandbox worlds from SCROLL files"
+
+[[bin]]
+name = "hexroll3-cli"
+path = "src/main.rs"
+
+[dependencies]
+hexroll3-scroll = { path = "../hexroll3-scroll" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"

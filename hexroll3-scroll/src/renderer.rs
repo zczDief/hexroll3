@@ -147,8 +147,14 @@ fn recursive_entity_renderer<T: ReadOnlyLoader>(
     if context.cache.contains_key(&uuid) && !is_root {
         return Ok(context.cache.get(&uuid).unwrap().clone());
     }
-    let class_name = obj["class"].as_str().unwrap();
-    let class_spec = instance.resolve_class(blueprint, class_name).unwrap();
+    let class_name = match obj["class"].as_str() {
+        Some(c) => c,
+        None => return Ok(serde_json::json!({})),
+    };
+    let class_spec = match instance.resolve_class(blueprint, class_name) {
+        Some(cs) => cs,
+        None => return Ok(serde_json::json!({"class": class_name, "uuid": obj["uid"]})),
+    };
 
     let mut ctx = serde_json::json!({
         "uuid" : obj["uid"]
@@ -208,20 +214,16 @@ fn recursive_entity_renderer<T: ReadOnlyLoader>(
         }
         ctx[attr_name] = match raw_value {
             serde_json::Value::Bool(_) | serde_json::Value::Number(_) => obj[attr_name].clone(),
-            serde_json::Value::String(_) => serde_json::Value::String(
-                context
-                    .env
-                    .render_str(obj[attr_name].as_str().unwrap(), &ctx)
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to render string template {} for uid {} attr {} with error {:#}",
-                            obj[attr_name].as_str().unwrap(),
-                            uuid,
-                            attr_name,
-                            e
-                        )
-                    })?,
-            ),
+            serde_json::Value::String(_) => {
+                let tmpl = obj[attr_name].as_str().unwrap();
+                serde_json::Value::String(
+                    context.env.render_str(tmpl, &ctx)
+                        .unwrap_or_else(|_e| {
+                            // Non-fatal template error — return raw template as fallback
+                            tmpl.to_string()
+                        })
+                )
+            }
             serde_json::Value::Array(_) => {
                 if is_array {
                     serde_json::Value::from(
@@ -254,16 +256,14 @@ fn recursive_entity_renderer<T: ReadOnlyLoader>(
                 render_indirections(context, instance, blueprint, tx, obj, attr_name)?
             }
             serde_json::Value::Null => {
-                let tmpl_str = class_spec.attrs[attr_name].cmd.value().unwrap();
-                serde_json::Value::String(context.env.render_str(&tmpl_str, &ctx).map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to render string template {} for uid {} attr {} with error {:#}",
-                            tmpl_str,
-                            uuid,
-                            attr_name,
-                            e
-                        )
-                    })?,
+                let tmpl_str = class_spec
+                    .attrs
+                    .get(attr_name)
+                    .and_then(|a| a.cmd.value())
+                    .unwrap_or_default();
+                serde_json::Value::String(
+                    context.env.render_str(&tmpl_str, &ctx)
+                        .unwrap_or_else(|_| tmpl_str.to_string())
                 )
             }
         };

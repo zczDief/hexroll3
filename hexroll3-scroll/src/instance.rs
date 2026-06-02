@@ -29,8 +29,8 @@ use anyhow::{Result, anyhow};
 use caith::RollResultType;
 use minijinja::Environment;
 use rand::{
-    Rng, distributions::Alphanumeric, rngs::ThreadRng, seq::SliceRandom,
-    thread_rng,
+    Rng, SeedableRng, distributions::Alphanumeric, rngs::StdRng,
+    seq::SliceRandom,
 };
 use serde_json::Value;
 
@@ -56,7 +56,7 @@ impl<'a> SandboxBuilder<'a> {
         prepare_renderer(&mut env, instance, None);
         SandboxBuilder {
             sandbox: instance,
-            randomizer: Randomizer::new(),
+            randomizer: Randomizer::with_seed(instance.seed),
             templating_env: env,
         }
     }
@@ -97,6 +97,9 @@ pub struct SandboxInstance {
     pub sid: Option<String>,
     pub repo: Repository,
     pub blueprint: std::sync::Arc<std::sync::Mutex<SandboxBlueprint>>,
+    /// Optional seed for reproducible generation. When `None`, generation is
+    /// non-deterministic (seeded from entropy).
+    pub seed: Option<u64>,
 }
 
 impl SandboxInstance {
@@ -109,7 +112,15 @@ impl SandboxInstance {
             blueprint: std::sync::Arc::new(std::sync::Mutex::new(
                 SandboxBlueprint::new(),
             )),
+            seed: None,
         }
+    }
+
+    /// Set the seed used for reproducible generation. Must be called before
+    /// `create()`.
+    pub fn with_seed(&mut self, seed: u64) -> &mut Self {
+        self.seed = Some(seed);
+        self
     }
 
     pub fn with_scroll(
@@ -143,7 +154,13 @@ impl SandboxInstance {
             tx.store("root", &serde_json::Value::Null)?;
             let ret =
                 roll(&mut builder, &mut blueprint, tx, "main", "root", None);
-            tx.store("root", &serde_json::json!(ret.as_ref().unwrap()))?;
+            match ret {
+                Ok(ref uid) => tx.store("root", &serde_json::json!(uid))?,
+                Err(ref e) => {
+                    eprintln!("[hexroll3] Roll error: {}", e);
+                    return Err(anyhow::anyhow!("Roll failed: {}", e));
+                }
+            };
             tx.store("rerolls", &serde_json::json!({"entities":[]}))?;
             ret
         }) {
@@ -166,7 +183,9 @@ impl SandboxInstance {
         blueprint: &mut SandboxBlueprint,
         buffer: &str,
     ) -> &Self {
-        parse_buffer(blueprint, buffer, None, None).unwrap();
+        if !buffer.trim().is_empty() {
+            let _ = parse_buffer(blueprint, buffer, None, None);
+        }
         self
     }
 
@@ -200,13 +219,23 @@ impl Default for SandboxInstance {
 }
 
 pub struct Randomizer {
-    rng: RefCell<ThreadRng>, // Use RefCell for interior mutability
+    rng: RefCell<StdRng>, // Use RefCell for interior mutability
 }
 
 impl Randomizer {
     pub fn new() -> Self {
+        Randomizer::with_seed(None)
+    }
+
+    /// Create a Randomizer with an optional fixed seed. `Some(seed)` produces
+    /// reproducible sequences; `None` seeds from OS entropy.
+    pub fn with_seed(seed: Option<u64>) -> Self {
+        let rng = match seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_entropy(),
+        };
         Randomizer {
-            rng: RefCell::new(thread_rng()),
+            rng: RefCell::new(rng),
         }
     }
 

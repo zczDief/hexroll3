@@ -29,7 +29,9 @@ members = [
   "hexroll3-signaling",
   "hexroll3-testbed",
   "hexroll3-dungeoneer",
-  "hexroll3-cartographer"
+  "hexroll3-cartographer",
+  "hexroll3-cli",
+  "hexroll3-server",
 ]
 
 resolver = "2"

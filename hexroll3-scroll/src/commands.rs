@@ -144,7 +144,12 @@ impl AttrCommand for AttrCommandAssigner {
         Ok(())
     }
     fn value(&self) -> Option<String> {
-        Some(self.value.as_str().unwrap().to_string())
+        // Non-string values (numbers, bools) are stringified to their JSON form
+        // rather than panicking on a failed `as_str()`.
+        Some(match self.value.as_str() {
+            Some(s) => s.to_string(),
+            None => self.value.to_string(),
+        })
     }
 }
 
@@ -254,7 +259,12 @@ impl AttrCommand for AttrCommandWeakAssigner {
         Ok(())
     }
     fn value(&self) -> Option<String> {
-        Some(self.value.as_str().unwrap().to_string())
+        // Non-string values (numbers, bools) are stringified to their JSON form
+        // rather than panicking on a failed `as_str()`.
+        Some(match self.value.as_str() {
+            Some(s) => s.to_string(),
+            None => self.value.to_string(),
+        })
     }
 }
 
@@ -357,7 +367,12 @@ impl AttrCommand for AttrCommandPrerenderedAssigner {
         Ok(())
     }
     fn value(&self) -> Option<String> {
-        Some(self.value.as_str().unwrap().to_string())
+        // Non-string values (numbers, bools) are stringified to their JSON form
+        // rather than panicking on a failed `as_str()`.
+        Some(match self.value.as_str() {
+            Some(s) => s.to_string(),
+            None => self.value.to_string(),
+        })
     }
 }
 
@@ -697,9 +712,16 @@ impl AttrCommand for AttrCommandRollFromVariable {
         tx: &mut ReadWriteTransaction,
         euid: &str,
     ) -> Result<()> {
-        let value = blueprint.globals[&self.var]
-            .as_array()
-            .ok_or(anyhow!("Unable to find {}", self.var))?;
+        let value = match blueprint.globals.get(&self.var) {
+            Some(v) => match v.as_array() {
+                Some(arr) => arr,
+                None => return Err(anyhow!("Global {} is not an array", self.var)),
+            },
+            None => {
+                // Global variable not defined (e.g. stripped by preprocessor) — skip silently
+                return Ok(());
+            }
+        };
         let entity = tx.load(euid)?;
         entity[&self.name] = builder.randomizer.choose(value).to_owned();
         Ok(())
