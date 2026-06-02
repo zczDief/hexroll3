@@ -166,6 +166,11 @@ struct AreaInfo {
     description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     encounter: Option<MonsterBrief>,
+    /// Ouro plantado na sala (derivado do tier — o valor exato do hexroll é um
+    /// template não-resolvido headless). 0 = sem tesouro.
+    treasure_gold: i64,
+    /// Nomes de itens mágicos encontrados na sala (se houver).
+    treasure_items: Vec<String>,
 }
 
 #[tokio::main]
@@ -529,6 +534,37 @@ fn monster_brief(v: &Value) -> Option<MonsterBrief> {
     })
 }
 
+/// Deterministic FNV-1a hash of a string (for seed-stable derived values).
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Recursively collect magic-item names (objects whose class contains
+/// "MagicItem") from a rendered value.
+fn find_magic_items(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(o) => {
+            if o.get("class").and_then(|c| c.as_str()).is_some_and(|c| c.contains("MagicItem")) {
+                let name = field_str(v, "Title");
+                let name = if name.is_empty() { field_str(v, "Name") } else { name };
+                if !name.is_empty() && !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            for (_, child) in o {
+                find_magic_items(child, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| find_magic_items(x, out)),
+        _ => {}
+    }
+}
+
 /// Parse a hexroll NPC class like "FighterLevel5" → ("fighter", 5).
 fn npc_class_level(class: &str) -> Option<(String, i64)> {
     for base in ["Fighter", "Cleric", "Magicuser", "Thief", "Dwarf", "Elf", "Halfling"] {
@@ -787,6 +823,27 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                     };
                     // Room encounter is nested under the room's Feature; search.
                     let encounter = find_monster(&ar);
+
+                    // Treasure: the room's Feature carries treasure (DungeonRemains /
+                    // DungeonTreasureTierN). Hexroll's exact gp is an unresolved
+                    // template headless, so we plant a deterministic, tier-scaled
+                    // amount (seed-stable via the area uid). Magic-item names, when
+                    // they render cleanly, are surfaced separately.
+                    let feat_class = ar["Feature"]["class"].as_str().unwrap_or("");
+                    let has_treasure = feat_class.starts_with("DungeonTreasure")
+                        || feat_class == "DungeonRemains";
+                    let tier = field_str(&ar, "FeatureLevelClass")
+                        .chars().filter(|ch| ch.is_ascii_digit()).last()
+                        .and_then(|ch| ch.to_digit(10)).unwrap_or(1) as i64;
+                    let treasure_gold = if has_treasure {
+                        let span = (tier as u64) * 40 + 30;
+                        tier * 30 + (fnv1a(c) % span) as i64
+                    } else {
+                        0
+                    };
+                    let mut treasure_items: Vec<String> = Vec::new();
+                    find_magic_items(&ar, &mut treasure_items);
+
                     // Room connectivity is reconstructed client-side via an MST
                     // over room coordinates (hexroll's exact corridor graph lives
                     // in separate entities we don't surface here).
@@ -797,6 +854,8 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                         title,
                         description,
                         encounter,
+                        treasure_gold,
+                        treasure_items,
                     });
                 }
                 areas.sort_by_key(|a| a.number);
