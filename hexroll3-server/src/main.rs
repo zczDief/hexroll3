@@ -133,6 +133,11 @@ struct SettlementInfo {
     npcs: Vec<NpcBrief>,
     /// Ganchos de aventura / missões oferecidos no assentamento.
     quests: Vec<QuestBrief>,
+    /// Taverna/estalagem do assentamento (nome, tipo, prato típico).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tavern: Option<TavernBrief>,
+    /// Lojas tipadas do assentamento (nome + tipo).
+    shops: Vec<ShopBrief>,
 }
 
 #[derive(Serialize)]
@@ -141,6 +146,24 @@ struct QuestBrief {
     kind: String,
     /// Texto da missão já renderizado pelo motor (nomes, recompensa, local).
     text: String,
+}
+
+#[derive(Serialize)]
+struct TavernBrief {
+    /// Nome próprio da taverna, ex.: "The Sad Goblin Tavern".
+    name: String,
+    /// Tipo: "Tavern" / "Lodge" / "Inn" …
+    kind: String,
+    /// Prato típico (flavor), se disponível.
+    dish: String,
+}
+
+#[derive(Serialize)]
+struct ShopBrief {
+    /// Nome próprio, ex.: "Aqualina's Weeds".
+    name: String,
+    /// Tipo de loja, ex.: "Herbalist" / "Fish Market".
+    kind: String,
 }
 
 #[derive(Serialize)]
@@ -613,6 +636,14 @@ fn npc_class_level(class: &str) -> Option<(String, i64)> {
     None
 }
 
+/// Remove aspas (retas ou curvas) ao redor de um nome.
+fn strip_quotes(s: &str) -> String {
+    s.trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '“' || c == '”')
+        .trim()
+        .to_string()
+}
+
 /// Mapeia a classe de uma entidade de quest do hexroll para um tipo curto.
 /// Retorna `None` para classes que não são missões oferecíveis.
 fn quest_kind(class: &str) -> Option<String> {
@@ -842,33 +873,73 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                 });
             }
 
-            // Ganchos de aventura: caminhada transitiva pela subárvore do
-            // assentamento, renderizando entidades de quest (o texto só resolve
-            // via render_entity — nomes, dungeons e recompensa entram aí).
+            // Caminhada transitiva única pela subárvore do assentamento:
+            // colhe ganchos de aventura (quests) + interior (taverna, lojas).
+            // O texto/nome só resolve via render_entity. A subárvore "vaza"
+            // para assentamentos vizinhos via back-links — por isso taverna/
+            // lojas são filtradas por SettlementUUID == este assentamento.
             let mut quests: Vec<QuestBrief> = Vec::new();
+            let mut shops: Vec<ShopBrief> = Vec::new();
+            let mut tavern: Option<TavernBrief> = None;
+            let mut tavern_dish = String::new();
             {
                 let mut seenq = std::collections::HashSet::new();
                 let mut frontier = vec![uid.clone()];
                 while let Some(u) = frontier.pop() {
-                    if quests.len() >= 6 || !seenq.insert(u.clone()) || seenq.len() > 4000 {
-                        if quests.len() >= 6 { break; }
-                        continue;
-                    }
+                    if !seenq.insert(u.clone()) || seenq.len() > 4000 { continue; }
                     let Ok(e) = tx.load(&u) else { continue };
-                    let cl = e.value["class"].as_str().unwrap_or("");
-                    if let Some(qkind) = quest_kind(cl) {
-                        if let Ok(rq) = render_entity(&render_instance, &mut bp, tx, &e.value, true) {
-                            let text = clean_quest_text(&html_to_text(rq["Description"].as_str().unwrap_or("")));
-                            if quest_text_ok(&text)
-                                && !quests.iter().any(|q: &QuestBrief| q.text == text)
+                    let cl = e.value["class"].as_str().unwrap_or("").to_string();
+
+                    if let Some(qkind) = quest_kind(&cl) {
+                        if quests.len() < 6 {
+                            if let Ok(rq) = render_entity(&render_instance, &mut bp, tx, &e.value, true) {
+                                let text = clean_quest_text(&html_to_text(rq["Description"].as_str().unwrap_or("")));
+                                if quest_text_ok(&text)
+                                    && !quests.iter().any(|q: &QuestBrief| q.text == text)
+                                {
+                                    quests.push(QuestBrief { kind: qkind, text });
+                                }
+                            }
+                        }
+                    } else if cl == "DistrictTavern" && tavern.is_none() {
+                        if let Ok(re) = render_entity(&render_instance, &mut bp, tx, &e.value, true) {
+                            if re["SettlementUUID"].as_str() == Some(uid.as_str()) {
+                                let name = strip_quotes(&field_str(&re, "Title"));
+                                let tkind = field_str(&re, "LinkedName");
+                                let tkind = tkind.split(" (").next().unwrap_or("Tavern").trim().to_string();
+                                if !name.is_empty() {
+                                    tavern = Some(TavernBrief { name, kind: tkind, dish: String::new() });
+                                }
+                            }
+                        }
+                    } else if cl == "TavernDish" && tavern_dish.is_empty() {
+                        if let Ok(re) = render_entity(&render_instance, &mut bp, tx, &e.value, true) {
+                            tavern_dish = html_to_text(re["Description"].as_str().unwrap_or(""))
+                                .split_whitespace().collect::<Vec<_>>().join(" ");
+                        }
+                    } else if shops.len() < 8 {
+                        // Loja tipada: tem BaseName + Title + pertence a um distrito.
+                        if let Ok(re) = render_entity(&render_instance, &mut bp, tx, &e.value, true) {
+                            let base = field_str(&re, "BaseName");
+                            let title = field_str(&re, "Title");
+                            let in_district = re.get("DistrictUUID").and_then(|v| v.as_str()).is_some();
+                            let mine = re["SettlementUUID"].as_str() == Some(uid.as_str());
+                            if mine && in_district && !base.is_empty() && !title.is_empty()
+                                && !shops.iter().any(|s: &ShopBrief| s.name == base)
                             {
-                                quests.push(QuestBrief { kind: qkind, text });
+                                shops.push(ShopBrief { name: base, kind: title });
                             }
                         }
                     }
+
                     let mut ch = Vec::new();
                     collect_uids_recursive(&e.value, &mut ch, 3);
                     for c in ch { if !seenq.contains(&c) { frontier.push(c); } }
+                }
+                if let Some(t) = tavern.as_mut() {
+                    if t.dish.is_empty() && tavern_dish.split_whitespace().count() >= 4 {
+                        t.dish = tavern_dish;
+                    }
                 }
             }
 
@@ -881,6 +952,8 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                 population: field_str(&r, "Population"),
                 npcs,
                 quests,
+                tavern,
+                shops,
             });
         }
 
