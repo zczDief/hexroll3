@@ -171,6 +171,16 @@ struct AreaInfo {
     treasure_gold: i64,
     /// Nomes de itens mágicos encontrados na sala (se houver).
     treasure_items: Vec<String>,
+    /// Armadilha da sala (de Feature.AreaTrap), se houver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trap: Option<TrapBrief>,
+}
+
+#[derive(Serialize)]
+struct TrapBrief {
+    name: String,
+    /// Prosa descrevendo a armadilha (inclui save/dano; o front extrai).
+    description: String,
 }
 
 #[tokio::main]
@@ -534,6 +544,18 @@ fn monster_brief(v: &Value) -> Option<MonsterBrief> {
     })
 }
 
+/// "SwingingBladeTrap" → "Swinging Blade Trap".
+fn humanize_class(s: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && c.is_uppercase() {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Deterministic FNV-1a hash of a string (for seed-stable derived values).
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -844,6 +866,20 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                     let mut treasure_items: Vec<String> = Vec::new();
                     find_magic_items(&ar, &mut treasure_items);
 
+                    // Armadilha da sala (Feature.AreaTrap).
+                    let trap = ar["Feature"]["AreaTrap"].as_object().and_then(|t| {
+                        let cls = t.get("class").and_then(|c| c.as_str()).unwrap_or("");
+                        let desc = html_to_text(
+                            t.get("Description").and_then(|d| d.as_str()).unwrap_or(""),
+                        );
+                        // Pula placeholders "NoTrap" e armadilhas sem descrição.
+                        if desc.is_empty() || cls.contains("NoTrap") || cls.contains("None") {
+                            None
+                        } else {
+                            Some(TrapBrief { name: humanize_class(cls), description: desc })
+                        }
+                    });
+
                     // Room connectivity is reconstructed client-side via an MST
                     // over room coordinates (hexroll's exact corridor graph lives
                     // in separate entities we don't surface here).
@@ -856,6 +892,7 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                         encounter,
                         treasure_gold,
                         treasure_items,
+                        trap,
                     });
                 }
                 areas.sort_by_key(|a| a.number);
