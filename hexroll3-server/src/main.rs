@@ -105,6 +105,10 @@ struct RealmSizing {
     /// Dungeons excavated across the realm. Excavation is cheap; this mostly
     /// caps payload size and dungeon density.
     max_dungeons: usize,
+    /// Wilderness features (landmarks: watchtower, graveyard, arena…) appended
+    /// onto hexes. Cheap to roll; gives the overworld named POIs beyond
+    /// settlements/dungeons. Bounded so payload/gen-cost stay predictable.
+    max_features: usize,
     /// Wall-clock budget before the worker is killed and the client falls back.
     timeout_secs: u64,
 }
@@ -115,13 +119,13 @@ fn realm_sizing(map_size: Option<&str>) -> RealmSizing {
     // leak CPU into later requests), so a high ceiling never poisons the server.
     match map_size.unwrap_or("medium") {
         // ~5×19 ≈ 95 hexes · ~10s
-        "small" => RealmSizing { regions: 5, tiles_min: 16, tiles_max: 22, max_dungeons: 5, timeout_secs: 45 },
+        "small" => RealmSizing { regions: 5, tiles_min: 16, tiles_max: 22, max_dungeons: 5, max_features: 6, timeout_secs: 45 },
         // ~12×28 ≈ 336 hexes · ~40s
-        "large" => RealmSizing { regions: 12, tiles_min: 24, tiles_max: 32, max_dungeons: 15, timeout_secs: 115 },
+        "large" => RealmSizing { regions: 12, tiles_min: 24, tiles_max: 32, max_dungeons: 15, max_features: 18, timeout_secs: 115 },
         // ~19×33 ≈ 627 hexes · ~75s
-        "giant" => RealmSizing { regions: 19, tiles_min: 30, tiles_max: 36, max_dungeons: 22, timeout_secs: 165 },
+        "giant" => RealmSizing { regions: 19, tiles_min: 30, tiles_max: 36, max_dungeons: 22, max_features: 28, timeout_secs: 165 },
         // medium ~8×21 ≈ 168 hexes · ~20s
-        _ => RealmSizing { regions: 8, tiles_min: 18, tiles_max: 24, max_dungeons: 9, timeout_secs: 70 },
+        _ => RealmSizing { regions: 8, tiles_min: 18, tiles_max: 24, max_dungeons: 9, max_features: 10, timeout_secs: 70 },
     }
 }
 
@@ -139,6 +143,23 @@ struct GenerateResponse {
     regions: Vec<RegionInfo>,
     settlements: Vec<SettlementInfo>,
     dungeons: Vec<DungeonInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    factions: Vec<FactionBrief>,
+}
+
+#[derive(Serialize)]
+struct FactionBrief {
+    /// Nome completo, ex.: "The Bloodied Veil".
+    name: String,
+    /// "Cult" / "Militia" / "Syndicate".
+    kind: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    leader: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    alignment: String,
+    /// uid da masmorra-covil (FactionLair.DungeonUUID), se houver.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    lair_dungeon: String,
 }
 
 #[derive(Serialize)]
@@ -169,6 +190,15 @@ struct HexInfo {
     /// uid of a dungeon on this hex (see top-level `dungeons`).
     #[serde(skip_serializing_if = "Option::is_none")]
     dungeon: Option<String>,
+    /// Wilderness landmark on this hex (watchtower, graveyard, arena…).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feature: Option<FeatureBrief>,
+}
+
+#[derive(Serialize, Clone)]
+struct FeatureBrief {
+    name: String,
+    description: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -231,6 +261,13 @@ struct ShopBrief {
     name: String,
     /// Tipo de loja, ex.: "Herbalist" / "Fish Market".
     kind: String,
+    /// Multiplicador de preço do distrito (hexroll CostFactor; 1.0 = padrão).
+    #[serde(skip_serializing_if = "is_default_cost")]
+    cost_factor: f64,
+}
+
+fn is_default_cost(c: &f64) -> bool {
+    (*c - 1.0).abs() < f64::EPSILON
 }
 
 #[derive(Serialize)]
@@ -255,6 +292,9 @@ struct DungeonInfo {
     hex: String,
     entrances: String,
     areas: Vec<AreaInfo>,
+    /// Wandering monster table (DungeonWanderingMonsters.monsters), deduped by name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    wandering: Vec<MonsterBrief>,
 }
 
 #[derive(Serialize)]
@@ -276,6 +316,9 @@ struct AreaInfo {
     trap: Option<TrapBrief>,
     /// Números das salas conectadas por passagem (grafo real de corredores).
     connections: Vec<i64>,
+    /// Subset of `connections` reached only via a secret door (hidden until found).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    secret: Vec<i64>,
 }
 
 #[derive(Serialize)]
@@ -502,7 +545,9 @@ fn generate_world(scroll_dir: &PathBuf, seed: Option<u64>, sizing: RealmSizing) 
     if let Some(s) = seed {
         instance.with_seed(s);
     }
+    let t0 = std::time::Instant::now();
     instance.with_scroll(scroll_dir.join("main.scroll"))?;
+    tracing::info!("with_scroll: {:.1}s", t0.elapsed().as_secs_f32());
     // Wire the cartographer's data provider: it fills the OSR scrolls' empty
     // `DungeonMap {}` / `CaveMap {}` placeholders with a real excavated interior
     // — rooms (with coordinates), doors, secret doors, passages, and per-area
@@ -519,27 +564,48 @@ fn generate_world(scroll_dir: &PathBuf, seed: Option<u64>, sizing: RealmSizing) 
         // matches the requested map-size chip. Region count is fixed and the
         // tiles-per-region band is tightened; this is read at create() time,
         // so setting it after with_scroll() (which loaded the defaults) wins.
-        // Fewer regions ⇒ fewer forced dungeon excavations ⇒ much faster gen
-        // and a far lower chance of hitting a pathological (looping) instance.
+        //
+        // CRITICAL: also zero out settlements, dungeons and factions so that
+        // create() only builds the geographic skeleton (regions + hexes +
+        // terrain + roaming encounters). The scroll defaults for these are
+        // 6-9 dungeons, 6-9 settlements and 3-5 factions, which means the
+        // cartographer would excavate 6-9 extra dungeons during create() ON
+        // TOP of what populate_features() adds — causing most seeds to exceed
+        // the timeout. populate_features() is the sole path for all content.
         bp.globals.insert("minimum_number_of_regions".into(), serde_json::json!(sizing.regions));
         bp.globals.insert("maximum_number_of_regions".into(), serde_json::json!(sizing.regions));
+        bp.globals.insert("minimum_number_of_dungeons".into(), serde_json::json!(0));
+        bp.globals.insert("maximum_number_of_dungeons".into(), serde_json::json!(0));
+        bp.globals.insert("minimum_number_of_settlements".into(), serde_json::json!(0));
+        bp.globals.insert("maximum_number_of_settlements".into(), serde_json::json!(0));
+        bp.globals.insert("minimum_number_of_factions".into(), serde_json::json!(0));
+        bp.globals.insert("maximum_number_of_factions".into(), serde_json::json!(0));
+        // Note: settlement class dispatch uses a hardcoded `settlement_classes`
+        // list (Village:3, Town:2, City:2) that cannot be overridden via globals.
+        // We force Village via the class name in append() calls instead.
         for terr in ["mountains", "forest", "desert", "plains", "jungle", "swamps", "tundra"] {
             bp.globals.insert(format!("minimum_tiles_per_{terr}_region"), serde_json::json!(sizing.tiles_min));
             bp.globals.insert(format!("maximum_tiles_per_{terr}_region"), serde_json::json!(sizing.tiles_max));
         }
     }
+    let t1 = std::time::Instant::now();
     instance.create(
         sandbox_path
             .to_str()
             .ok_or_else(|| anyhow!("non-utf8 sandbox path"))?,
     )?;
+    tracing::info!("create: {:.1}s", t1.elapsed().as_secs_f32());
 
     // Drive hexroll's own generators headless to populate settlements & dungeons
     // (the initial roll only fills terrain + a roaming monster per hex; features
     // are normally rolled on-demand when a user clicks a hex in the app).
+    let t2 = std::time::Instant::now();
     populate_features(&instance, sizing)?;
+    tracing::info!("populate_features: {:.1}s", t2.elapsed().as_secs_f32());
 
+    let t3 = std::time::Instant::now();
     let resp = export_all(instance, seed)?;
+    tracing::info!("export_all: {:.1}s", t3.elapsed().as_secs_f32());
 
     // Best-effort cleanup; the .hxr is a transient artifact.
     let _ = std::fs::remove_file(&sandbox_path);
@@ -621,6 +687,9 @@ fn populate_features(instance: &SandboxInstance, sizing: RealmSizing) -> Result<
     let region_count = regions.len();
     builder.sandbox.repo.mutate(|tx| {
         let mut settle_idxs: Vec<usize> = Vec::with_capacity(region_count);
+        // Hexes already carrying a settlement/dungeon — features avoid them so a
+        // landmark never collides with a town/dungeon on the same tile.
+        let mut used_hexes: std::collections::HashSet<String> = std::collections::HashSet::new();
         for hexes in &regions {
             let n = hexes.len();
             if n == 0 {
@@ -629,10 +698,16 @@ fn populate_features(instance: &SandboxInstance, sizing: RealmSizing) -> Result<
             }
             let settle_idx = builder.randomizer.in_range(0, n as i32 - 1) as usize;
             settle_idxs.push(settle_idx);
+            // Force Village class_override: the generic "Settlement" dispatch
+            // can pick City/Town subtypes whose deeply nested NPC sub-trees
+            // enter data-dependent infinite loops for many seeds. Village is
+            // structurally simpler and avoids most of those cases.
             if let Err(e) =
-                append(&builder, &mut blueprint, tx, &hexes[settle_idx], "Settlement", None, 1)
+                append(&builder, &mut blueprint, tx, &hexes[settle_idx], "Settlement", Some("Village"), 1)
             {
-                tracing::warn!("append Settlement on {}: {e:#}", hexes[settle_idx]);
+                tracing::warn!("append Settlement: {e:#}");
+            } else {
+                used_hexes.insert(hexes[settle_idx].clone());
             }
         }
 
@@ -659,6 +734,8 @@ fn populate_features(instance: &SandboxInstance, sizing: RealmSizing) -> Result<
                     append(&builder, &mut blueprint, tx, &hexes[di], "Dungeon", None, 1)
                 {
                     tracing::warn!("append Dungeon: {e}");
+                } else {
+                    used_hexes.insert(hexes[di].clone());
                 }
                 placed += 1;
             }
@@ -667,7 +744,55 @@ fn populate_features(instance: &SandboxInstance, sizing: RealmSizing) -> Result<
             }
             round += 1;
         }
-        tracing::info!("populate: {} settlements, {} dungeons (budget {})", region_count, placed, sizing.max_dungeons);
+
+        // Wilderness features (landmarks) — spread round-robin across regions,
+        // one per free hex, up to the budget. Skips hexes already used by a
+        // settlement/dungeon so a landmark never shares a tile.
+        let mut feats = 0usize;
+        let mut frnd = 0usize;
+        while feats < sizing.max_features {
+            let mut any = false;
+            for hexes in regions.iter() {
+                if feats >= sizing.max_features { break; }
+                let n = hexes.len();
+                if n == 0 || frnd >= n { continue; }
+                any = true;
+                let fi = builder.randomizer.in_range(0, n as i32 - 1) as usize;
+                let hex = &hexes[fi];
+                if used_hexes.contains(hex) { continue; }
+                if let Err(e) = append(&builder, &mut blueprint, tx, hex, "Feature", None, 1) {
+                    tracing::warn!("append Feature: {e}");
+                } else {
+                    used_hexes.insert(hex.clone());
+                    feats += 1;
+                }
+            }
+            if !any { break; }
+            frnd += 1;
+        }
+
+        // Facções (cultos/milícias/sindicatos): geradas via append no realm (o
+        // scroll declara [0..0 factions], então não saem do create() inicial).
+        // Cada uma traz líder e covil (FactionLair → dungeon).
+        let mut faction_count = 0usize;
+        let main_uid = tx.load("root").ok()
+            .and_then(|root| root.as_str().map(str::to_string));
+        let realm_uid = main_uid.as_deref()
+            .and_then(|uid| tx.load(uid).ok())
+            .and_then(|main| {
+                main["realms"].as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+        if let Some(realm_uid) = realm_uid {
+            let n = builder.randomizer.in_range(3, 5) as u32;
+            match append(&builder, &mut blueprint, tx, &realm_uid, "factions", None, n) {
+                Ok(uids) => faction_count = uids.len(),
+                Err(e) => { tracing::warn!("append Faction: {e}"); }
+            }
+        }
+        tracing::info!("populate: {} settlements, {} dungeons (budget {}), {} features (budget {}), {} factions", region_count, placed, sizing.max_dungeons, feats, sizing.max_features, faction_count);
         Ok(())
     })?;
     Ok(())
@@ -844,6 +969,27 @@ fn npc_class_level(class: &str) -> Option<(String, i64)> {
     None
 }
 
+/// Normaliza prosa renderizada headless: desfaz mojibake (UTF-8 reinterpretado
+/// como latin1, possivelmente em dois níveis) e colapsa espaços. Seguro: se a
+/// reinterpretação não for UTF-8 válido (ex.: acento legítimo), mantém o texto.
+fn clean_prose(s: &str) -> String {
+    let mut t = s.to_string();
+    for _ in 0..2 {
+        if t.chars().all(|c| (c as u32) <= 0xFF) {
+            let bytes: Vec<u8> = t.chars().map(|c| c as u8).collect();
+            match String::from_utf8(bytes) {
+                Ok(u) if u != t => { t = u; }
+                _ => break,
+            }
+        } else {
+            break;
+        }
+    }
+    // Resíduos de nível único (€/™/aspas curvas fora do alcance latin1).
+    t = t.replace("â€™", "'").replace("â€œ", "\"").replace("â€", "\"");
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Remove aspas (retas ou curvas) ao redor de um nome.
 fn strip_quotes(s: &str) -> String {
     s.trim()
@@ -981,6 +1127,41 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
             realm_type: field_str(&realm_r, "RealmType"),
         };
 
+        // ── Factions (cults/militias/syndicates) + lairs ────────────────
+        let faction_uids: Vec<String> = tx.load(&realm_uid)?.value["factions"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let mut factions: Vec<FactionBrief> = Vec::new();
+        for fu in &faction_uids {
+            let kind = tx.load(fu).ok()
+                .and_then(|raw| raw.value["class"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            let Some(f) = render_uid!(fu) else { continue };
+            // FactionName desdobra para {Full|Title}; idem leader e lair.
+            let name = {
+                let n = field_str(&f["FactionName"], "Full");
+                if n.is_empty() { field_str(&f, "FactionName") } else { n }
+            };
+            if name.is_empty() { continue; }
+            let leader = {
+                let l = field_str(&f["FactionLeader"]["Name"], "Full");
+                if l.is_empty() { field_str(&f["FactionLeader"], "Name") } else { l }
+            };
+            let alignment = {
+                let a = field_str(&f, "Alignment");
+                if a.is_empty() { field_str(&f, "AcceptedAlignment") } else { a }
+            };
+            let lair_dungeon = {
+                let d = field_str(&f["FactionLair"], "DungeonUUID");
+                if d.is_empty() { field_str(&f["Lair"], "DungeonUUID") } else { d }
+            };
+            factions.push(FactionBrief {
+                name: clean_prose(&name), kind: humanize_class(&kind),
+                leader: clean_prose(&leader), alignment, lair_dungeon,
+            });
+        }
+
         let mut regions: Vec<RegionInfo> = Vec::new();
         let mut settlement_uids: Vec<String> = Vec::new();
         let mut dungeon_uids: Vec<String> = Vec::new();
@@ -1028,12 +1209,25 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                 // Encounter: render the hex and read its inline Monster.
                 let encounter = render_uid!(hex_uid)
                     .and_then(|h| monster_brief(&h["Monster"]));
+                // Wilderness feature (landmark): render it and read Name + Description.
+                let feature = first_uid(&hex_raw.value["Feature"])
+                    .and_then(|fu| render_uid!(&fu))
+                    .and_then(|f| {
+                        let name = {
+                            let n = field_str(&f, "Name");
+                            if n.is_empty() { field_str(&f, "Title") } else { n }
+                        };
+                        if name.is_empty() { return None; }
+                        let description = clean_prose(&html_to_text(&field_str(&f, "Description")));
+                        Some(FeatureBrief { name: clean_prose(&name), description })
+                    });
                 hexes.push(HexInfo {
                     uid: hex_uid.clone(),
                     terrain: hex_terrain,
                     encounter,
                     settlement,
                     dungeon,
+                    feature,
                 });
             }
             regions.push(RegionInfo { name: region_name, terrain, hexes });
@@ -1135,7 +1329,15 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                             if mine && in_district && !base.is_empty() && !title.is_empty()
                                 && !shops.iter().any(|s: &ShopBrief| s.name == base)
                             {
-                                shops.push(ShopBrief { name: base, kind: title });
+                                // CostFactor vive no Distrito; lê via DistrictUUID.
+                                let cost_factor = re.get("DistrictUUID")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|du| render_uid!(du))
+                                    .map(|dr| field_str(&dr, "CostFactor"))
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                    .filter(|c| *c > 0.0)
+                                    .unwrap_or(1.0);
+                                shops.push(ShopBrief { name: base, kind: title, cost_factor });
                             }
                         }
                     }
@@ -1209,9 +1411,13 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                     // Grafo real de corredores: as passagens da sala carregam o
                     // número da sala-alvo (Room). Coletamos esses alvos.
                     let mut connections: Vec<i64> = Vec::new();
+                    // Salas alcançadas via porta SECRETA (secret_door_*) — exportadas à
+                    // parte para o cliente poder gatear/revelar via busca.
+                    let mut secret: Vec<i64> = Vec::new();
                     if let Some(o) = c_raw.value.as_object() {
                         for (k, v) in o {
-                            if !k.starts_with("passage_") && !k.starts_with("secret_door_") {
+                            let is_secret = k.starts_with("secret_door_");
+                            if !k.starts_with("passage_") && !is_secret {
                                 continue;
                             }
                             let cu = v.as_array().and_then(|a| a.first()).and_then(|x| x.as_str())
@@ -1221,6 +1427,9 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                                     if let Some(room) = cr.value["Room"].as_i64() {
                                         if !connections.contains(&room) {
                                             connections.push(room);
+                                        }
+                                        if is_secret && !secret.contains(&room) {
+                                            secret.push(room);
                                         }
                                     }
                                 }
@@ -1287,10 +1496,35 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                         treasure_items,
                         trap,
                         connections,
+                        secret,
                     });
                 }
                 areas.sort_by_key(|a| a.number);
             }
+
+            // Wandering monster table: DungeonWanderingMonsters.monsters (10 rolls),
+            // deduped by name. Surfaced so the client rolls the dungeon's own table.
+            let wandering = {
+                let wu = match &raw.value["WanderingMonsters"] {
+                    Value::Array(a) => a.first().and_then(|v| v.as_str().map(str::to_string)),
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                };
+                let mut out: Vec<MonsterBrief> = Vec::new();
+                if let Some(wu) = wu {
+                    if let Some(w) = render_uid!(&wu) {
+                        if let Some(arr) = w["monsters"].as_array() {
+                            let mut seen = std::collections::HashSet::new();
+                            for m in arr {
+                                if let Some(mb) = monster_brief(m).or_else(|| find_monster(m)) {
+                                    if seen.insert(mb.name.clone()) { out.push(mb); }
+                                }
+                            }
+                        }
+                    }
+                }
+                out
+            };
 
             dungeons.push(DungeonInfo {
                 uid: uid.clone(),
@@ -1300,6 +1534,7 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                 hex: field_str(&r, "HexLink"),
                 entrances: field_str(&r, "Entrances"),
                 areas,
+                wandering,
             });
         }
 
@@ -1311,6 +1546,7 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
             regions,
             settlements,
             dungeons,
+            factions,
         })
     })
 }
