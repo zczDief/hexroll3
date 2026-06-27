@@ -164,6 +164,8 @@ struct GenerateResponse {
 
 #[derive(Serialize)]
 struct FactionBrief {
+    /// UUID estável da facção (para ligar NPC→facção no frontend).
+    id: String,
     /// Nome completo, ex.: "The Bloodied Veil".
     name: String,
     /// "Cult" / "Militia" / "Syndicate".
@@ -172,6 +174,12 @@ struct FactionBrief {
     leader: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     alignment: String,
+    /// Nome da região onde opera (derivado do hex do covil).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    region: String,
+    /// uid do hex do covil (derivado via dungeon→hex map).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    lair_hex: String,
     /// uid da masmorra-covil (FactionLair.DungeonUUID), se houver.
     #[serde(skip_serializing_if = "String::is_empty")]
     lair_dungeon: String,
@@ -295,6 +303,9 @@ struct NpcBrief {
     armour_class: String,
     thac0: String,
     alignment: String,
+    /// UUID da facção a que este NPC pertence (se disponível na engine).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    faction_id: String,
 }
 
 #[derive(Serialize)]
@@ -1142,6 +1153,43 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
             realm_type: field_str(&realm_r, "RealmType"),
         };
 
+        // ── Preliminary maps: hex→region e dungeon→hex (sem render, só load) ───────
+        let region_uids_pre: Vec<String> = tx.load(&realm_uid)
+            .ok()
+            .and_then(|r| r.value["regions"].as_array().map(|a| {
+                a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+            }))
+            .unwrap_or_default();
+        let mut hex_region: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut dungeon_hex: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for ruid in &region_uids_pre {
+            let Ok(rraw) = tx.load(ruid) else { continue };
+            // Use raw load only (no render) to avoid stack overflow — region
+            // name will be filled in from the main region loop below when we
+            // back-patch hex_region with the rendered name.
+            let rname = {
+                let n = field_str(&rraw.value, "Name");
+                if n.is_empty() { field_str(&rraw.value, "Title") } else { n }
+            };
+            let hex_uids: Vec<String> = rraw.value["Hexmap"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            for huid in hex_uids {
+                hex_region.insert(huid.clone(), rname.clone());
+                // Locate dungeon on this hex (array of 0 or 1 UUIDs).
+                if let Ok(hraw) = tx.load(&huid) {
+                    let duid = hraw.value["Dungeon"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_str().map(str::to_string));
+                    if let Some(d) = duid {
+                        dungeon_hex.insert(d, huid);
+                    }
+                }
+            }
+        }
+
         // ── Factions (cults/militias/syndicates) + lairs ────────────────
         let faction_uids: Vec<String> = tx.load(&realm_uid)?.value["factions"]
             .as_array()
@@ -1171,9 +1219,22 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                 let d = field_str(&f["FactionLair"], "DungeonUUID");
                 if d.is_empty() { field_str(&f["Lair"], "DungeonUUID") } else { d }
             };
+            let lair_hex = dungeon_hex.get(&lair_dungeon).cloned().unwrap_or_default();
+            let region = if !lair_hex.is_empty() {
+                hex_region.get(&lair_hex).cloned().unwrap_or_default()
+            } else {
+                // Fallback: tenta campo "Region" no render da facção.
+                field_str(&f, "Region")
+            };
             factions.push(FactionBrief {
-                name: clean_prose(&name), kind: humanize_class(&kind),
-                leader: clean_prose(&leader), alignment, lair_dungeon,
+                id: fu.clone(),
+                name: clean_prose(&name),
+                kind: humanize_class(&kind),
+                leader: clean_prose(&leader),
+                alignment,
+                region,
+                lair_hex,
+                lair_dungeon,
             });
         }
 
@@ -1203,6 +1264,16 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                     if n.is_empty() { field_str(&r, "Title") } else { n }
                 })
                 .unwrap_or_default();
+
+            // Back-patch hex_region with the rendered region name (preliminary
+            // pass used raw load which may lack the rendered name).
+            if !region_name.is_empty() {
+                for huid in &hex_uids {
+                    if let Some(v) = hex_region.get_mut(huid) {
+                        *v = region_name.clone();
+                    }
+                }
+            }
 
             let mut hexes: Vec<HexInfo> = Vec::new();
             for hex_uid in &hex_uids {
@@ -1262,6 +1333,7 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
             };
 
             // NPCs notáveis: entidades com classe "<Classe>Level<N>" no subtree.
+            let faction_uid_set: std::collections::HashSet<String> = factions.iter().map(|f| f.id.clone()).collect();
             let mut npcs: Vec<NpcBrief> = Vec::new();
             let mut cand: Vec<String> = Vec::new();
             collect_uids_recursive(&raw.value, &mut cand, 5);
@@ -1279,6 +1351,22 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                     let n = field_str(&nr, "Name");
                     if n.is_empty() { field_str(&nr, "Title") } else { n }
                 };
+                // Tenta encontrar back-link para facção: varre campos top-level do NPC
+                // à procura de um UUID que case com uma facção conhecida.
+                let faction_id = {
+                    let mut found = String::new();
+                    if let Some(obj) = craw.value.as_object() {
+                        for (_k, v) in obj {
+                            if let Some(uid) = v.as_str() {
+                                if faction_uid_set.contains(uid) {
+                                    found = uid.to_string();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    found
+                };
                 npcs.push(NpcBrief {
                     name: if nname.is_empty() { base.clone() } else { nname },
                     class: base,
@@ -1287,6 +1375,7 @@ fn export_all(instance: SandboxInstance, seed: Option<u64>) -> Result<GenerateRe
                     armour_class: field_str(&nr, "ArmourClass"),
                     thac0: field_str(&nr, "THAC0"),
                     alignment: field_str(&nr, "Alignment"),
+                    faction_id,
                 });
             }
 
