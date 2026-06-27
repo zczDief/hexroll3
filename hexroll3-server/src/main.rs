@@ -113,19 +113,34 @@ struct RealmSizing {
     timeout_secs: u64,
 }
 
+/// Reads `HEXROLL_TIMEOUT_SCALE` from the environment (default 1.0). Values
+/// above 1.0 multiply every per-size timeout proportionally — useful when the
+/// host machine is slower than the benchmarked baseline (e.g. Docker on ARM,
+/// constrained CI). Set to 3 in docker-compose for the typical dev environment.
+fn timeout_scale() -> f64 {
+    std::env::var("HEXROLL_TIMEOUT_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&v| v > 0.0)
+        .unwrap_or(1.0)
+}
+
 fn realm_sizing(map_size: Option<&str>) -> RealmSizing {
-    // Timeouts ≈ measured roll cost (~0.1s/hex) + generous margin. The margin
-    // is safe to keep wide because an overrunning worker is SIGKILLed (it cannot
-    // leak CPU into later requests), so a high ceiling never poisons the server.
+    // Base timeouts ≈ measured roll cost (~0.1s/hex) + generous margin. The
+    // margin is safe to keep wide because an overrunning worker is SIGKILLed
+    // (it cannot leak CPU into later requests), so a high ceiling never
+    // poisons the server. Multiply by HEXROLL_TIMEOUT_SCALE for slow hosts.
+    let scale = timeout_scale();
+    let t = |base: u64| ((base as f64) * scale).ceil() as u64;
     match map_size.unwrap_or("medium") {
-        // ~5×19 ≈ 95 hexes · ~10s
-        "small" => RealmSizing { regions: 5, tiles_min: 16, tiles_max: 22, max_dungeons: 5, max_features: 6, timeout_secs: 45 },
-        // ~12×28 ≈ 336 hexes · ~40s
-        "large" => RealmSizing { regions: 12, tiles_min: 24, tiles_max: 32, max_dungeons: 15, max_features: 18, timeout_secs: 115 },
-        // ~19×33 ≈ 627 hexes · ~75s
-        "giant" => RealmSizing { regions: 19, tiles_min: 30, tiles_max: 36, max_dungeons: 22, max_features: 28, timeout_secs: 165 },
-        // medium ~8×21 ≈ 168 hexes · ~20s
-        _ => RealmSizing { regions: 8, tiles_min: 18, tiles_max: 24, max_dungeons: 9, max_features: 10, timeout_secs: 70 },
+        // ~5×19 ≈ 95 hexes · ~10s (base)
+        "small" => RealmSizing { regions: 5, tiles_min: 16, tiles_max: 22, max_dungeons: 5, max_features: 6, timeout_secs: t(45) },
+        // ~12×28 ≈ 336 hexes · ~40s (base)
+        "large" => RealmSizing { regions: 12, tiles_min: 24, tiles_max: 32, max_dungeons: 15, max_features: 18, timeout_secs: t(115) },
+        // ~19×33 ≈ 627 hexes · ~75s (base)
+        "giant" => RealmSizing { regions: 19, tiles_min: 30, tiles_max: 36, max_dungeons: 22, max_features: 28, timeout_secs: t(165) },
+        // medium ~8×21 ≈ 168 hexes · ~20s (base)
+        _ => RealmSizing { regions: 8, tiles_min: 18, tiles_max: 24, max_dungeons: 9, max_features: 10, timeout_secs: t(70) },
     }
 }
 
